@@ -1,0 +1,423 @@
+pipeline_name: gma_embedding_and_clustering
+version: 0.5  # updated to include training stub, loss config, and clarifications
+
+description: |
+  Learn geo-embeddings from spend and mobility time series,
+  cluster into GMAs that are spatially contiguous,
+  optimize for statistical power, and minimize spillover.
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+config:
+  hyperparameters:
+    learning_rate: 0.001
+    batch_size: 128
+    epochs: 50
+    kernel_size: 7            # temporal convolution window
+    hidden_dim: 64            # TemporalConvNet output channels
+    embedding_dim: 32         # final geo embedding size
+    loss_type: reconstruction  # 'reconstruction' | 'contrastive' | 'forecast'
+  spatial_graph:
+    method: knn
+    k: 8                      # number of neighbors for adjacency
+  clustering:
+    spectral:
+      n_clusters: 200
+    skater:
+      constraints:
+        population_balance: true
+        max_pop_deviation: 0.1  # max cluster population deviation (10%)
+    louvain:
+      resolution: 1.0          # controls community granularity
+
+# -----------------------------------------------------------------------------
+# PHASE 1: EMBEDDING TRAINING & EMBEDDING GENERATION
+# -----------------------------------------------------------------------------
+phases:
+  - phase_id: 1
+    name: train_embeddings
+    input_data:
+      - spend_impression_timeseries
+      - mobility_panel
+    steps:
+      - name: extract_temporal_features
+        module: embedding.utils
+        function: extract_temporal_features
+        args:
+          df_key: spend_impression_timeseries
+          window: 30
+        outputs:
+          - feature_array: features.npy  # shape (n_geos, in_channels, time)
+      - name: build_adjacency_matrix
+        module: embedding.utils
+        function: create_graph_adjacency_matrix
+        args:
+          geo_df_key: spatial_lookup_table
+          method: "knn"
+          k: 8
+        outputs:
+          - adj_matrix: adj_matrix.npy  # binary sparse matrix (n_geos, n_geos)
+      - name: train_lightning_model
+        module: embedding.temporal_graph  # referring to GMAEmbeddingLightningModule
+        class: GMAEmbeddingLightningModule
+        args:
+          in_channels: "$config.hyperparameters.in_channels"
+          hidden_channels: "$config.hyperparameters.hidden_dim"
+          kernel_size: "$config.hyperparameters.kernel_size"
+          embedding_dim: "$config.hyperparameters.embedding_dim"
+          adj_matrix: "$build_adjacency_matrix.outputs.adj_matrix"
+          lr: "$config.hyperparameters.learning_rate"
+          loss_type: "$config.hyperparameters.loss_type"
+          feature_array: "$extract_temporal_features.outputs.feature_array"
+          batch_size: "$config.hyperparameters.batch_size"
+          epochs: "$config.hyperparameters.epochs"
+        outputs:
+          - model_checkpoint: checkpoint.pt
+      - name: generate_embeddings
+        module: pytorch_lightning  # use Lightning Trainer.predict
+        function: trainer_predict
+        args:
+          checkpoint: "$train_lightning_model.outputs.model_checkpoint"
+          feature_array: "$extract_temporal_features.outputs.feature_array"
+          adj_matrix: "$build_adjacency_matrix.outputs.adj_matrix"
+          batch_size: "$config.hyperparameters.batch_size"
+        outputs:
+          - embeddings: embeddings.npy  # (n_geos, embedding_dim)
+# PHASE 2: CLUSTERING
+# -----------------------------------------------------------------------------
+  - phase_id: 2
+    name: run_clustering
+    input_data:
+      - embeddings.npy
+      - adj_matrix.npy
+    clustering_methods:
+      - spectral:
+          module: clustering.spectral
+          function: run_spectral_clustering
+          args:
+            embeddings: embeddings.npy
+            adj_matrix: adj_matrix.npy
+            n_clusters: "$config.clustering.spectral.n_clusters"
+      - skater:
+          module: clustering.skater
+          function: run_skater_clustering
+          args:
+            embeddings: embeddings.npy
+            adj_matrix: adj_matrix.npy
+            constraints: "$config.clustering.skater.constraints"
+      - louvain:
+          module: clustering.louvain
+          function: run_louvain_clustering
+          args:
+            adj_matrix: adj_matrix.npy
+            resolution: "$config.clustering.louvain.resolution"
+    outputs:
+      - gma_assignments_spectral: gma_spectral.csv
+      - gma_assignments_skater: gma_skater.csv
+      - gma_assignments_louvain: gma_louvain.csv
+
+# -----------------------------------------------------------------------------
+# PHASE 3: EVALUATION & EXPORT
+# -----------------------------------------------------------------------------
+  - phase_id: 3
+    name: evaluate_and_export
+    input_data:
+      - assignment_paths:
+          - gma_spectral.csv
+          - gma_skater.csv
+          - gma_louvain.csv
+      - embeddings.npy
+      - adj_matrix.npy
+    steps:
+      - name: compute_metrics
+        module: evaluation.metrics
+        function: evaluate_gmas
+        args:
+          assignment_paths: "$evaluate_and_export.inputs.assignment_paths"
+          embeddings: embeddings.npy
+          adj_matrix: adj_matrix.npy
+      - name: export_best_gma_map
+        module: export
+        function: select_and_write_best
+        args:
+          metrics: compute_metrics.output
+          target: gma_map_us_v1.csv
+    outputs:
+      - gma_map_us_v1.csv
+
+# -----------------------------------------------------------------------------
+# IMPLEMENTATION STUBS (with docstrings)
+# -----------------------------------------------------------------------------
+implementation:
+  files:
+    - path: "embedding/temporal_graph.py"
+  stubs: |
+    import torch
+    import torch.nn as nn
+    import pytorch_lightning as pl
+
+    class TemporalConvNet(nn.Module):
+        """
+        A 1D temporal convolutional network modeling per-geo time series.
+
+        Args:
+          in_channels (int): number of input series/features per geo
+          hidden_channels (int): output channels of convolution
+          kernel_size (int): temporal window size
+        """
+        def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int):
+            super().__init__()
+            padding = kernel_size // 2
+            self.conv1d = nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=hidden_channels,
+                kernel_size=kernel_size,
+                padding=padding
+            )
+            self.activation = nn.ReLU()
+            self.pool = nn.AdaptiveAvgPool1d(1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """
+            Forward pass over input tensor of shape (batch_size, in_channels, seq_len).
+
+            Returns:
+              Tensor of shape (batch_size, hidden_channels)
+            """
+            out = self.conv1d(x)
+            out = self.activation(out)
+            pooled = self.pool(out)
+            return pooled.squeeze(-1)
+
+    class GraphSAGEEncoder(nn.Module):
+        """
+        GraphSAGE encoder aggregating neighbor and self features.
+
+        Args:
+          in_channels (int): feature dimension per node
+          out_channels (int): output embedding dimension
+          adj_matrix (torch.Tensor): binary sparse adjacency (n_nodes, n_nodes)
+        """
+        def __init__(self, in_channels: int, out_channels: int, adj_matrix: torch.Tensor):
+            super().__init__()
+            self.adj = adj_matrix
+            self.lin_self = nn.Linear(in_channels, out_channels, bias=False)
+            self.lin_neigh = nn.Linear(in_channels, out_channels, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """
+            Args:
+              x: Tensor of shape (n_nodes, in_channels)
+
+            Returns:
+              Tensor of shape (n_nodes, out_channels)
+            """
+            self_feat = self.lin_self(x)
+            neigh_sum = torch.matmul(self.adj, x)
+            neigh_feat = self.lin_neigh(neigh_sum)
+            return nn.functional.relu(self_feat + neigh_feat)
+
+    class GMAEmbeddingLightningModule(pl.LightningModule):
+        """
+        PyTorch Lightning module combining TemporalConvNet and GraphSAGEEncoder.
+
+        Args:
+          in_channels (int): number of input series per geo
+          hidden_channels (int): conv output channels
+          kernel_size (int): conv window size
+          embedding_dim (int): output embedding dimension
+          adj_matrix (torch.Tensor): sparse adjacency matrix
+          lr (float): learning rate
+          loss_type (str): 'reconstruction' | 'contrastive' | 'forecast'
+        """
+        def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int,
+                     embedding_dim: int, adj_matrix: torch.Tensor,
+                     lr: float, loss_type: str = 'reconstruction'):
+            super().__init__()
+            self.save_hyperparameters()
+            self.temporal_net = TemporalConvNet(in_channels, hidden_channels, kernel_size)
+            self.graph_encoder = GraphSAGEEncoder(hidden_channels, embedding_dim, adj_matrix)
+            if loss_type == 'reconstruction':
+                self.loss_fn = nn.MSELoss()
+                self.decoder = nn.Linear(embedding_dim, hidden_channels)
+            else:
+                raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            t_feats = self.temporal_net(x)
+            emb = self.graph_encoder(t_feats)
+            return emb
+
+        def training_step(self, batch, batch_idx):
+            """
+            Single training iteration: encode, decode for reconstruction, compute loss.
+            """
+            x, _ = batch
+            t_feats = self.temporal_net(x)
+            emb = self.graph_encoder(t_feats)
+            recon = self.decoder(emb)
+            loss = self.loss_fn(recon, t_feats)
+            self.log('train_recon_loss', loss)
+            return loss
+
+        def validation_step(self, batch, batch_idx):
+            x, _ = batch
+            t_feats = self.temporal_net(x)
+            emb = self.graph_encoder(t_feats)
+            recon = self.decoder(emb)
+            loss = self.loss_fn(recon, t_feats)
+            self.log('val_recon_loss', loss, prog_bar=True)
+
+        def configure_optimizers(self):
+            return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+- path: "clustering/methods.py"
+      stubs: |
+        import numpy as np
+        from typing import List, Dict
+
+        def run_spectral_clustering(
+            embeddings: np.ndarray,
+            adj_matrix: np.ndarray,
+            n_clusters: int
+        ) -> np.ndarray:
+            """
+            Run spectral clustering on learned embeddings with spatial adjacency.
+
+            Args:
+              embeddings (np.ndarray): shape (n_geos, embedding_dim)
+              adj_matrix (np.ndarray): shape (n_geos, n_geos)
+              n_clusters (int): desired number of clusters
+
+            Returns:
+              np.ndarray: array of shape (n_geos,) containing integer cluster labels
+            """
+            ...
+
+        def run_skater_clustering(
+            embeddings: np.ndarray,
+            adj_matrix: np.ndarray,
+            constraints: Dict[str, any]
+        ) -> np.ndarray:
+            """
+            Apply SKATER algorithm to embeddings with spatial constraints.
+
+            Args:
+              embeddings (np.ndarray): shape (n_geos, embedding_dim)
+              adj_matrix (np.ndarray): shape (n_geos, n_geos)
+              constraints (Dict[str, any]): population and balance constraints
+
+            Returns:
+              np.ndarray: array of shape (n_geos,) containing integer cluster labels
+            """
+            ...
+
+        def run_louvain_clustering(
+            adj_matrix: np.ndarray,
+            resolution: float = 1.0
+        ) -> np.ndarray:
+            """
+            Perform community detection using modularity-based Louvain method.
+
+            Args:
+              adj_matrix (np.ndarray): shape (n_geos, n_geos)
+              resolution (float): controls cluster granularity
+
+            Returns:
+              np.ndarray: array of shape (n_geos,) containing integer cluster labels
+            """
+            ...
+
+    - path: "evaluation/metrics.py"
+      stubs: |
+        from typing import List, Dict, Any
+        import numpy as np
+
+        def evaluate_gmas(
+            assignment_paths: List[str],
+            embeddings: np.ndarray,
+            adj_matrix: np.ndarray
+        ) -> Dict[str, Dict[str, float]]:
+            """
+            Compute evaluation metrics for each GMA assignment.
+
+            Args:
+              assignment_paths (List[str]): list of CSVs [geo_id, cluster_label]
+              embeddings (np.ndarray): (n_geos, embedding_dim)
+              adj_matrix (np.ndarray): (n_geos, n_geos)
+
+            Returns:
+              Dict[str, Dict[str, float]]: method -> {metric_name: value}
+            """
+            ...
+
+    - path: "export.py"
+      stubs: |
+        from typing import Dict, Any
+
+        def select_and_write_best(
+            metrics: Dict[str, Dict[str, float]],
+            target: str
+        ) -> None:
+            """
+            Select the best GMA assignment and write its CSV.
+
+            Args:
+              metrics (Dict[str, Dict[str, float]]): evaluation metrics per method
+              target (str): output CSV path
+            """
+            ...
+
+# -----------------------------------------------------------------------------
+# IMPLEMENTATION EXAMPLES
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+implementation_examples:
+  # ... unchanged examples for TemporalConvNet & GraphSAGEEncoder
+
+# -----------------------------------------------------------------------------
+# TRAINING & ORCHESTRATION
+# -----------------------------------------------------------------------------
+training_and_orchestration:
+  - name: recommended_frameworks
+    description: |
+      Use high-level trainers to separate model & loop logic:
+        * PyTorch Lightning: subclass LightningModule for .fit(), .validate(), .predict().
+        * Hugging Face Trainer: wrap model and Datasets for training/eval loops.
+
+# -----------------------------------------------------------------------------
+# TESTING & VALIDATION
+# -----------------------------------------------------------------------------
+testing:
+  unit_tests:
+    - name: test_temporal_convnet_shape
+      module: embedding.temporal_graph
+      function: TemporalConvNet.forward
+      description: Assert random input (batch, in_channels, seq_len)
+        returns (batch, hidden_channels) without errors.
+    - name: test_graphsageencoder_shape
+      module: embedding.temporal_graph
+      function: GraphSAGEEncoder.forward
+      description: Verify output (n_nodes, out_channels) given random x & adj.
+  synthetic_pipeline_tests:
+    - name: test_clustering_on_toy_gaussians
+      description: Generate two 2D Gaussian blobs, bypass embedding,
+        run clustering with n_clusters=2 and expect ARI=1.0.
+    - name: test_louvain_on_disconnected_cliques
+      description: Two disconnected cliques in adj produce two clusters.
+  property_based_tests:
+    - name: test_louvain_resolution_monotonic
+      description: Increasing resolution never reduces cluster count.
+  integration_tests:
+    - name: test_overfit_micro_dataset
+      description: Overfit 4-point toy dataset end-to-end with zero loss.
+  regression_tests:
+    - name: snapshot_phase1_phase2
+      description: Snapshot embeddings & assignments on fixture; fail on diff.
+  boundary_tests:
+    - name: test_empty_inputs
+      description: Empty data or zero-length arrays should ValueError.
+    - name: test_invalid_hyperparams
+      description: Invalid hyperparams (e.g. k=0) should raise informative errors.
