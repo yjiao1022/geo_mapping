@@ -179,13 +179,156 @@ class TestGMAEmbeddingLightningModule:
         """Test that invalid loss type raises error."""
         adj_matrix = torch.eye(10)
         
+        # This should work during initialization, but fail during training step
+        model = GMAEmbeddingLightningModule(
+            in_channels=2,
+            hidden_channels=16,
+            kernel_size=3,
+            embedding_dim=8,
+            adj_matrix=adj_matrix,
+            lr=0.001,
+            loss_type="invalid_loss"
+        )
+        
+        # Error should occur during loss computation
+        batch = (torch.randn(10, 2, 20), torch.zeros(10))
         with pytest.raises(ValueError, match="Unsupported loss_type"):
-            GMAEmbeddingLightningModule(
-                in_channels=2,
-                hidden_channels=16,
-                kernel_size=3,
-                embedding_dim=8,
-                adj_matrix=adj_matrix,
-                lr=0.001,
-                loss_type="invalid_loss"
-            )
+            model._compute_loss(batch)
+    
+    def test_lightning_module_contrastive_loss(self):
+        """Test lightning module with contrastive loss."""
+        n_nodes = 16
+        adj_matrix = torch.eye(n_nodes)
+        
+        model = GMAEmbeddingLightningModule(
+            in_channels=2,
+            hidden_channels=16,
+            kernel_size=3,
+            embedding_dim=8,
+            adj_matrix=adj_matrix,
+            lr=0.001,
+            loss_type="contrastive",
+            contrastive_temperature=0.1
+        )
+        
+        # Test training step
+        x = torch.randn(n_nodes, 2, 20)
+        dummy_targets = torch.zeros(n_nodes)
+        batch = (x, dummy_targets)
+        
+        loss = model.training_step(batch, 0)
+        assert isinstance(loss, torch.Tensor)
+        assert loss >= 0
+    
+    def test_lightning_module_predictive_loss(self):
+        """Test lightning module with predictive loss."""
+        n_nodes = 16
+        adj_matrix = torch.eye(n_nodes)
+        
+        model = GMAEmbeddingLightningModule(
+            in_channels=2,
+            hidden_channels=16,
+            kernel_size=3,
+            embedding_dim=8,
+            adj_matrix=adj_matrix,
+            lr=0.001,
+            loss_type="predictive"
+        )
+        
+        # Test with proper targets for predictive loss
+        x = torch.randn(n_nodes, 2, 20)
+        targets = torch.randn(n_nodes, 2, 20)
+        batch = (x, targets)
+        
+        loss = model.training_step(batch, 0)
+        assert isinstance(loss, torch.Tensor)
+        assert loss >= 0
+    
+    def test_lightning_module_multi_loss(self):
+        """Test lightning module with multi-loss training."""
+        n_nodes = 12
+        adj_matrix = torch.eye(n_nodes)
+        
+        model = GMAEmbeddingLightningModule(
+            in_channels=2,
+            hidden_channels=16,
+            kernel_size=3,
+            embedding_dim=8,
+            adj_matrix=adj_matrix,
+            lr=0.001,
+            loss_type="multi",
+            loss_weights={'reconstruction': 0.5, 'contrastive': 0.5}
+        )
+        
+        # Test with targets for multi-loss
+        x = torch.randn(n_nodes, 2, 20)
+        targets = torch.randn(n_nodes, 2, 20)
+        batch = (x, targets)
+        
+        loss = model.training_step(batch, 0)
+        assert isinstance(loss, torch.Tensor)
+        assert loss >= 0
+    
+    def test_lightning_module_memory_bank_loss(self):
+        """Test lightning module with memory bank contrastive loss."""
+        n_nodes = 16
+        adj_matrix = torch.eye(n_nodes)
+        
+        model = GMAEmbeddingLightningModule(
+            in_channels=2,
+            hidden_channels=16,
+            kernel_size=3,
+            embedding_dim=8,
+            adj_matrix=adj_matrix,
+            lr=0.001,
+            loss_type="contrastive",
+            use_memory_bank=True,
+            memory_bank_size=128
+        )
+        
+        # Verify memory bank was created
+        assert hasattr(model, 'memory_bank_loss')
+        assert model.memory_bank_loss is not None
+        
+        # Test training step
+        x = torch.randn(n_nodes, 2, 20)
+        dummy_targets = torch.zeros(n_nodes)
+        batch = (x, dummy_targets)
+        
+        loss = model.training_step(batch, 0)
+        assert isinstance(loss, torch.Tensor)
+        assert loss >= 0
+    
+    def test_lightning_module_augmentation_config(self):
+        """Test lightning module with custom augmentation config."""
+        n_nodes = 12
+        adj_matrix = torch.eye(n_nodes)
+        
+        aug_config = {
+            'aug1_method': 'mask',
+            'aug2_method': 'jitter',
+            'mask_mask_prob': 0.3,
+            'jitter_noise_std': 0.05
+        }
+        
+        model = GMAEmbeddingLightningModule(
+            in_channels=2,
+            hidden_channels=16,
+            kernel_size=3,
+            embedding_dim=8,
+            adj_matrix=adj_matrix,
+            lr=0.001,
+            loss_type="contrastive",
+            augmentation_config=aug_config
+        )
+        
+        # Verify config was stored
+        assert model.augmentation_config == aug_config
+        
+        # Test that it works in training
+        x = torch.randn(n_nodes, 2, 20)
+        batch = (x, torch.zeros(n_nodes))
+        
+        loss = model.training_step(batch, 0)
+        assert isinstance(loss, torch.Tensor)
+        assert loss >= 0
