@@ -86,7 +86,7 @@ class TestOverfitMicroDataset:
         model.eval()
         with torch.no_grad():
             embeddings = model(feature_tensor)
-            final_loss = model.loss_fn(embeddings, embeddings)
+            final_loss = model._compute_reconstruction_loss(feature_tensor)
         
         # Should achieve very low loss (near zero) on this simple dataset
         assert final_loss < 0.01, f"Model failed to overfit toy dataset, loss: {final_loss}"
